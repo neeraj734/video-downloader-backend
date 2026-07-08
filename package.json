@@ -1,0 +1,20 @@
+{
+  "name": "video-downloader-backend",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Backend API for extracting downloadable video links with yt-dlp.",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "helmet": "^8.0.0"
+  }
+}
