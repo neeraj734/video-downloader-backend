@@ -47,6 +47,14 @@ router.post('/extract', async (req, res, next) => {
     }
 
     const cookies = isInstagramUrl(url) ? getInstagramCookieString() : undefined;
+
+    if (isInstagramUrl(url) && !cookies) {
+      return res.status(401).json({
+        error: 'INSTAGRAM_LOGIN_REQUIRED',
+        message: 'Please login to Instagram before downloading this link.',
+      });
+    }
+
     const result = await extractVideo(url, {cookies});
     return res.json(result);
   } catch (error) {
