@@ -30,7 +30,8 @@ const extractVideo = async (url, options = {}) => {
   }
 
   const downloadId = createDownloadJob({
-    cookies: options.cookies,
+    directUrl: directDownload.url,
+    httpHeaders: directDownload.httpHeaders,
     title: info.title || 'video',
     url: normalizedUrl,
   });
@@ -160,6 +161,11 @@ const streamVideoDownload = async (downloadId, res) => {
     return;
   }
 
+  if (job.directUrl) {
+    await streamDirectDownload(job, downloadId, res);
+    return;
+  }
+
   const cookieFilePath = await createCookieFile(job.cookies);
   let child;
   let stderr = '';
@@ -266,6 +272,74 @@ const streamVideoDownload = async (downloadId, res) => {
 
     res.end();
   });
+};
+
+const streamDirectDownload = async (job, downloadId, res) => {
+  const controller = new AbortController();
+  let isComplete = false;
+
+  res.on('close', () => {
+    if (!isComplete) {
+      controller.abort();
+    }
+  });
+
+  try {
+    const upstreamResponse = await fetch(job.directUrl, {
+      headers: job.httpHeaders || {},
+      signal: controller.signal,
+    });
+
+    if (!upstreamResponse.ok) {
+      const message = `Download server returned HTTP ${upstreamResponse.status}.`;
+
+      if (!res.headersSent) {
+        res.status(upstreamResponse.status).json({
+          error: 'DOWNLOAD_FAILED',
+          message,
+        });
+      } else {
+        res.destroy(new Error(message));
+      }
+
+      return;
+    }
+
+    const contentType = upstreamResponse.headers.get('content-type');
+    const contentLength = upstreamResponse.headers.get('content-length');
+
+    res.setHeader('Content-Type', contentType || 'video/mp4');
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename="${createSafeFileName(job.title)}"`,
+    );
+
+    if (contentLength) {
+      res.setHeader('Content-Length', contentLength);
+    }
+
+    for await (const chunk of upstreamResponse.body) {
+      res.write(chunk);
+    }
+
+    isComplete = true;
+    downloadJobs.delete(downloadId);
+    res.end();
+  } catch (error) {
+    if (error.name === 'AbortError') {
+      return;
+    }
+
+    if (!res.headersSent) {
+      res.status(422).json({
+        error: 'DOWNLOAD_FAILED',
+        message: error.message || 'The video download was interrupted.',
+      });
+      return;
+    }
+
+    res.destroy(error);
+  }
 };
 
 const createDownloadJob = job => {
