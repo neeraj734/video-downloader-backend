@@ -1,5 +1,6 @@
 const {spawn} = require('child_process');
 const crypto = require('crypto');
+const {createReadStream} = require('fs');
 const fs = require('fs/promises');
 const os = require('os');
 const path = require('path');
@@ -29,14 +30,20 @@ const extractVideo = async (url, options = {}) => {
     throw error;
   }
 
+  const downloadId = createDownloadJob({
+    cookies: options.cookies,
+    title: info.title || 'video',
+    url: normalizedUrl,
+  });
+
   return {
     title: info.title || 'Untitled video',
     platform: info.extractor_key || info.extractor || 'Unknown',
     thumbnail: info.thumbnail || null,
     duration: info.duration || null,
     quality: getQualityLabel(info),
-    downloadUrl: directDownload.url,
-    httpHeaders: directDownload.httpHeaders,
+    downloadPath: `/api/download/${downloadId}`,
+    httpHeaders: undefined,
   };
 };
 
@@ -154,184 +161,186 @@ const streamVideoDownload = async (downloadId, res) => {
     return;
   }
 
-  if (job.directUrl) {
-    await streamDirectDownload(job, downloadId, res);
-    return;
-  }
-
-  const cookieFilePath = await createCookieFile(job.cookies);
-  let child;
-  let stderr = '';
-  let hasStartedResponse = false;
-  let isComplete = false;
-
-  const args = [
-    '--no-warnings',
-    '--no-playlist',
-    '--format',
-    'b[ext=mp4]/best[ext=mp4]/best',
-    '--output',
-    '-',
-    job.url,
-  ];
-
-  if (cookieFilePath) {
-    args.splice(args.length - 1, 0, '--cookies', cookieFilePath);
-  }
-
-  const removeCookieFile = async () => {
-    if (cookieFilePath) {
-      await fs.rm(cookieFilePath, {force: true});
-    }
-  };
-
-  const failBeforeStreaming = (statusCode, code, message) => {
-    if (!hasStartedResponse && !res.headersSent) {
-      res.status(statusCode).json({error: code, message});
-      return;
-    }
-
-    res.destroy(new Error(message));
-  };
-
   try {
-    child = spawn(YT_DLP_PATH, args, {
-      windowsHide: true,
-    });
-  } catch (error) {
-    await removeCookieFile();
-    failBeforeStreaming(500, 'YT_DLP_UNAVAILABLE', error.message);
-    return;
-  }
+    const abortController = new AbortController();
 
-  res.on('close', () => {
-    if (!isComplete && child && !child.killed) {
-      child.kill('SIGTERM');
-    }
-  });
-
-  child.stderr.on('data', data => {
-    stderr += data.toString();
-  });
-
-  child.stdout.on('data', chunk => {
-    if (!hasStartedResponse) {
-      hasStartedResponse = true;
-      res.setHeader('Content-Type', 'video/mp4');
-      res.setHeader(
-        'Content-Disposition',
-        `attachment; filename="${createSafeFileName(job.title)}"`,
-      );
-    }
-
-    res.write(chunk);
-  });
-
-  child.on('error', async error => {
-    isComplete = true;
-    downloadJobs.delete(downloadId);
-    await removeCookieFile();
-
-    const message =
-      error.code === 'ENOENT'
-        ? 'yt-dlp is not installed or YT_DLP_PATH is incorrect.'
-        : error.message;
-
-    failBeforeStreaming(500, 'YT_DLP_UNAVAILABLE', message);
-  });
-
-  child.on('close', async code => {
-    if (isComplete) {
-      return;
-    }
-
-    isComplete = true;
-    downloadJobs.delete(downloadId);
-    await removeCookieFile();
-
-    if (code !== 0) {
-      failBeforeStreaming(
-        422,
-        'DOWNLOAD_FAILED',
-        cleanYtDlpMessage(stderr) || 'yt-dlp could not download this video.',
-      );
-      return;
-    }
-
-    if (!hasStartedResponse) {
-      failBeforeStreaming(422, 'EMPTY_DOWNLOAD', 'No video data was downloaded.');
-      return;
-    }
-
-    res.end();
-  });
-};
-
-const streamDirectDownload = async (job, downloadId, res) => {
-  const controller = new AbortController();
-  let isComplete = false;
-
-  res.on('close', () => {
-    if (!isComplete) {
-      controller.abort();
-    }
-  });
-
-  try {
-    const upstreamResponse = await fetch(job.directUrl, {
-      headers: job.httpHeaders || {},
-      signal: controller.signal,
+    res.on('close', () => {
+      abortController.abort();
     });
 
-    if (!upstreamResponse.ok) {
-      const message = `Download server returned HTTP ${upstreamResponse.status}.`;
+    const tempFilePath = await downloadJobToTempFile(
+      job,
+      abortController.signal,
+    );
+    const stats = await fs.stat(tempFilePath);
+    downloadJobs.delete(downloadId);
 
-      if (!res.headersSent) {
-        res.status(upstreamResponse.status).json({
-          error: 'DOWNLOAD_FAILED',
-          message,
-        });
-      } else {
-        res.destroy(new Error(message));
-      }
-
-      return;
-    }
-
-    const contentType = upstreamResponse.headers.get('content-type');
-    const contentLength = upstreamResponse.headers.get('content-length');
-
-    res.setHeader('Content-Type', contentType || 'video/mp4');
+    res.setHeader('Content-Type', 'video/mp4');
+    res.setHeader('Content-Length', String(stats.size));
     res.setHeader(
       'Content-Disposition',
       `attachment; filename="${createSafeFileName(job.title)}"`,
     );
 
-    if (contentLength) {
-      res.setHeader('Content-Length', contentLength);
-    }
+    const stream = createReadStream(tempFilePath);
+    let didCleanUpTempFile = false;
+    const cleanupTempFile = async () => {
+      if (didCleanUpTempFile) {
+        return;
+      }
 
-    for await (const chunk of upstreamResponse.body) {
-      res.write(chunk);
-    }
+      didCleanUpTempFile = true;
+      await fs.rm(tempFilePath, {force: true});
+    };
 
-    isComplete = true;
-    downloadJobs.delete(downloadId);
-    res.end();
+    stream.on('error', async error => {
+      await cleanupTempFile();
+
+      if (!res.headersSent) {
+        res.status(500).json({
+          error: 'DOWNLOAD_FAILED',
+          message: error.message || 'Could not read the downloaded video.',
+        });
+        return;
+      }
+
+      res.destroy(error);
+    });
+
+    stream.on('close', cleanupTempFile);
+    stream.pipe(res);
   } catch (error) {
-    if (error.name === 'AbortError') {
-      return;
-    }
+    const statusCode = error.statusCode || 422;
 
     if (!res.headersSent) {
-      res.status(422).json({
-        error: 'DOWNLOAD_FAILED',
-        message: error.message || 'The video download was interrupted.',
+      res.status(statusCode).json({
+        error: error.code || 'DOWNLOAD_FAILED',
+        message: error.message || 'yt-dlp could not download this video.',
       });
       return;
     }
 
     res.destroy(error);
+  }
+};
+
+const downloadJobToTempFile = async (job, abortSignal) => {
+  const cookieFilePath = await createCookieFile(job.cookies);
+  const tempFilePath = path.join(
+    os.tmpdir(),
+    `video-download-${Date.now()}-${Math.random().toString(36).slice(2)}.mp4`,
+  );
+
+  try {
+    await new Promise((resolve, reject) => {
+      const args = [
+        '--no-warnings',
+        '--no-playlist',
+        '--no-part',
+        '--force-overwrites',
+        '--retries',
+        '10',
+        '--fragment-retries',
+        '10',
+        '--format',
+        'b[ext=mp4]/best[ext=mp4]/best',
+        '--output',
+        tempFilePath,
+        job.url,
+      ];
+
+      if (cookieFilePath) {
+        args.splice(args.length - 1, 0, '--cookies', cookieFilePath);
+      }
+
+      const child = spawn(YT_DLP_PATH, args, {
+        windowsHide: true,
+      });
+
+      let stderr = '';
+      let isSettled = false;
+
+      const abortDownload = () => {
+        if (!isSettled && !child.killed) {
+          child.kill('SIGTERM');
+        }
+      };
+
+      if (abortSignal?.aborted) {
+        abortDownload();
+      } else {
+        abortSignal?.addEventListener('abort', abortDownload, {once: true});
+      }
+
+      child.stderr.on('data', data => {
+        stderr += data.toString();
+      });
+
+      child.on('error', error => {
+        if (isSettled) {
+          return;
+        }
+
+        isSettled = true;
+        abortSignal?.removeEventListener('abort', abortDownload);
+
+        const wrappedError = new Error(
+          error.code === 'ENOENT'
+            ? 'yt-dlp is not installed or YT_DLP_PATH is incorrect.'
+            : error.message,
+        );
+        wrappedError.statusCode = 500;
+        wrappedError.code = 'YT_DLP_UNAVAILABLE';
+        reject(wrappedError);
+      });
+
+      child.on('close', code => {
+        if (isSettled) {
+          return;
+        }
+
+        isSettled = true;
+        abortSignal?.removeEventListener('abort', abortDownload);
+
+        if (abortSignal?.aborted) {
+          const error = new Error('The video download was canceled.');
+          error.statusCode = 499;
+          error.code = 'DOWNLOAD_CANCELED';
+          reject(error);
+          return;
+        }
+
+        if (code !== 0) {
+          const error = new Error(
+            cleanYtDlpMessage(stderr) || 'yt-dlp could not download this video.',
+          );
+          error.statusCode = 422;
+          error.code = 'DOWNLOAD_FAILED';
+          reject(error);
+          return;
+        }
+
+        resolve();
+      });
+    });
+
+    const stats = await fs.stat(tempFilePath);
+
+    if (!stats.size) {
+      const error = new Error('No video data was downloaded.');
+      error.statusCode = 422;
+      error.code = 'EMPTY_DOWNLOAD';
+      throw error;
+    }
+
+    return tempFilePath;
+  } catch (error) {
+    await fs.rm(tempFilePath, {force: true});
+    throw error;
+  } finally {
+    if (cookieFilePath) {
+      await fs.rm(cookieFilePath, {force: true});
+    }
   }
 };
 
