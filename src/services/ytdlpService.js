@@ -29,21 +29,14 @@ const extractVideo = async (url, options = {}) => {
     throw error;
   }
 
-  const downloadId = createDownloadJob({
-    directUrl: directDownload.url,
-    httpHeaders: directDownload.httpHeaders,
-    title: info.title || 'video',
-    url: normalizedUrl,
-  });
-
   return {
     title: info.title || 'Untitled video',
     platform: info.extractor_key || info.extractor || 'Unknown',
     thumbnail: info.thumbnail || null,
     duration: info.duration || null,
     quality: getQualityLabel(info),
-    downloadPath: `/api/download/${downloadId}`,
-    httpHeaders: undefined,
+    downloadUrl: directDownload.url,
+    httpHeaders: directDownload.httpHeaders,
   };
 };
 
