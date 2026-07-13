@@ -166,40 +166,35 @@ const streamVideoDownload = async (downloadId, res) => {
 
   try {
     console.log(`[download] ytdlp-start id=${downloadId}`);
-    const abortController = new AbortController();
+    if (!job.tempFilePath) {
+      const abortController = new AbortController();
 
-    res.on('close', () => {
-      abortController.abort();
-    });
+      res.on('close', () => {
+        abortController.abort();
+      });
 
-    const tempFilePath = await downloadJobToTempFile(
-      job,
-      abortController.signal,
-    );
-    const stats = await fs.stat(tempFilePath);
-    downloadJobs.delete(downloadId);
-    console.log(`[download] ytdlp-complete id=${downloadId} bytes=${stats.size}`);
+      job.tempFilePath = await downloadJobToTempFile(
+        job,
+        abortController.signal,
+      );
+      job.completedAt = Date.now();
+      job.fileSize = (await fs.stat(job.tempFilePath)).size;
+      console.log(
+        `[download] ytdlp-complete id=${downloadId} bytes=${job.fileSize}`,
+      );
+    } else {
+      console.log(`[download] cached-file id=${downloadId} bytes=${job.fileSize}`);
+    }
 
     res.setHeader('Content-Type', 'video/mp4');
-    res.setHeader('Content-Length', String(stats.size));
+    res.setHeader('Content-Length', String(job.fileSize));
     res.setHeader(
       'Content-Disposition',
       `attachment; filename="${createSafeFileName(job.title)}"`,
     );
 
-    const stream = createReadStream(tempFilePath);
-    let didCleanUpTempFile = false;
-    const cleanupTempFile = async () => {
-      if (didCleanUpTempFile) {
-        return;
-      }
-
-      didCleanUpTempFile = true;
-      await fs.rm(tempFilePath, {force: true});
-    };
-
+    const stream = createReadStream(job.tempFilePath);
     stream.on('error', async error => {
-      await cleanupTempFile();
       console.error(`[download] file-stream-error id=${downloadId}`, error.message);
 
       if (!res.headersSent) {
@@ -213,7 +208,6 @@ const streamVideoDownload = async (downloadId, res) => {
       res.destroy(error);
     });
 
-    stream.on('close', cleanupTempFile);
     res.on('finish', () => {
       console.log(`[download] response-finished id=${downloadId}`);
     });
@@ -224,6 +218,10 @@ const streamVideoDownload = async (downloadId, res) => {
       `[download] failed id=${downloadId} code=${error.code || 'DOWNLOAD_FAILED'}`,
       error.message,
     );
+
+    if (!job.tempFilePath) {
+      downloadJobs.delete(downloadId);
+    }
 
     if (!res.headersSent) {
       res.status(statusCode).json({
@@ -373,6 +371,15 @@ const cleanupExpiredDownloadJobs = () => {
 
   for (const [downloadId, job] of downloadJobs.entries()) {
     if (job.createdAt < expiresBefore) {
+      if (job.tempFilePath) {
+        fs.rm(job.tempFilePath, {force: true}).catch(error => {
+          console.error(
+            `[download] temp-cleanup-failed id=${downloadId}`,
+            error.message,
+          );
+        });
+      }
+
       downloadJobs.delete(downloadId);
     }
   }
