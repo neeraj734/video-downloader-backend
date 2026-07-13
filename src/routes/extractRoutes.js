@@ -1,11 +1,43 @@
 const express = require('express');
+const {
+  getInstagramCookieString,
+  saveInstagramSession,
+} = require('../services/instagramSessionStore');
 const {extractVideo, streamVideoDownload} = require('../services/ytdlpService');
 
 const router = express.Router();
 
+router.post('/session/instagram', (req, res) => {
+  const {sessionId, csrfToken} = req.body || {};
+
+  if (!sessionId || typeof sessionId !== 'string') {
+    return res.status(400).json({
+      error: 'INVALID_INSTAGRAM_SESSION',
+      message: 'An Instagram sessionId is required.',
+    });
+  }
+
+  if (!csrfToken || typeof csrfToken !== 'string') {
+    return res.status(400).json({
+      error: 'INVALID_INSTAGRAM_SESSION',
+      message: 'An Instagram csrfToken is required.',
+    });
+  }
+
+  const session = saveInstagramSession({
+    csrfToken: csrfToken.trim(),
+    sessionId: sessionId.trim(),
+  });
+
+  return res.json({
+    ok: true,
+    updatedAt: session.updatedAt,
+  });
+});
+
 router.post('/extract', async (req, res, next) => {
   try {
-    const {url, cookies} = req.body || {};
+    const {url} = req.body || {};
 
     if (!url || typeof url !== 'string') {
       return res.status(400).json({
@@ -14,6 +46,7 @@ router.post('/extract', async (req, res, next) => {
       });
     }
 
+    const cookies = isInstagramUrl(url) ? getInstagramCookieString() : undefined;
     const result = await extractVideo(url, {cookies});
     return res.json(result);
   } catch (error) {
@@ -28,5 +61,7 @@ router.get('/download/:downloadId', async (req, res, next) => {
     return next(error);
   }
 });
+
+const isInstagramUrl = url => url.toLowerCase().includes('instagram.com');
 
 module.exports = router;
