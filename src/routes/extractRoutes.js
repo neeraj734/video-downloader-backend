@@ -1,5 +1,5 @@
 const express = require('express');
-const {extractVideo} = require('../services/ytdlpService');
+const {extractVideo, streamVideoDownload} = require('../services/ytdlpService');
 
 const router = express.Router();
 
@@ -16,6 +16,14 @@ router.post('/extract', async (req, res, next) => {
 
     const result = await extractVideo(url, {cookies});
     return res.json(result);
+  } catch (error) {
+    return next(error);
+  }
+});
+
+router.get('/download/:downloadId', async (req, res, next) => {
+  try {
+    await streamVideoDownload(req.params.downloadId, res);
   } catch (error) {
     return next(error);
   }

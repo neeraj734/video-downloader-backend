@@ -1,10 +1,13 @@
 const {spawn} = require('child_process');
+const crypto = require('crypto');
 const fs = require('fs/promises');
 const os = require('os');
 const path = require('path');
 
 const YT_DLP_PATH = process.env.YT_DLP_PATH || 'yt-dlp';
 const EXTRACT_TIMEOUT_MS = Number(process.env.EXTRACT_TIMEOUT_MS || 30000);
+const DOWNLOAD_JOB_TTL_MS = Number(process.env.DOWNLOAD_JOB_TTL_MS || 15 * 60 * 1000);
+const downloadJobs = new Map();
 
 const extractVideo = async (url, options = {}) => {
   const normalizedUrl = url.trim();
@@ -17,14 +20,20 @@ const extractVideo = async (url, options = {}) => {
   }
 
   const info = await runYtDlp(normalizedUrl, options);
-  const directUrl = getDirectDownloadUrl(info);
+  const directDownload = getDirectDownload(info);
 
-  if (!directUrl) {
+  if (!directDownload.url) {
     const error = new Error('Could not extract a direct downloadable video URL.');
     error.statusCode = 422;
     error.code = 'NO_DOWNLOAD_URL';
     throw error;
   }
+
+  const downloadId = createDownloadJob({
+    cookies: options.cookies,
+    title: info.title || 'video',
+    url: normalizedUrl,
+  });
 
   return {
     title: info.title || 'Untitled video',
@@ -32,7 +41,8 @@ const extractVideo = async (url, options = {}) => {
     thumbnail: info.thumbnail || null,
     duration: info.duration || null,
     quality: getQualityLabel(info),
-    downloadUrl: directUrl,
+    downloadPath: `/api/download/${downloadId}`,
+    httpHeaders: undefined,
   };
 };
 
@@ -46,7 +56,7 @@ const runYtDlp = async (url, options = {}) => {
       '--no-warnings',
       '--no-playlist',
       '--format',
-      'bv*+ba/b[ext=mp4]/b',
+      'b[ext=mp4]/best[ext=mp4]/best',
       url,
     ];
 
@@ -137,6 +147,147 @@ const runYtDlp = async (url, options = {}) => {
   }
 };
 
+const streamVideoDownload = async (downloadId, res) => {
+  cleanupExpiredDownloadJobs();
+
+  const job = downloadJobs.get(downloadId);
+
+  if (!job) {
+    res.status(404).json({
+      error: 'DOWNLOAD_NOT_FOUND',
+      message: 'This download link expired. Please prepare the download again.',
+    });
+    return;
+  }
+
+  const cookieFilePath = await createCookieFile(job.cookies);
+  let child;
+  let stderr = '';
+  let hasStartedResponse = false;
+  let isComplete = false;
+
+  const args = [
+    '--no-warnings',
+    '--no-playlist',
+    '--format',
+    'b[ext=mp4]/best[ext=mp4]/best',
+    '--output',
+    '-',
+    job.url,
+  ];
+
+  if (cookieFilePath) {
+    args.splice(args.length - 1, 0, '--cookies', cookieFilePath);
+  }
+
+  const removeCookieFile = async () => {
+    if (cookieFilePath) {
+      await fs.rm(cookieFilePath, {force: true});
+    }
+  };
+
+  const failBeforeStreaming = (statusCode, code, message) => {
+    if (!hasStartedResponse && !res.headersSent) {
+      res.status(statusCode).json({error: code, message});
+      return;
+    }
+
+    res.destroy(new Error(message));
+  };
+
+  try {
+    child = spawn(YT_DLP_PATH, args, {
+      windowsHide: true,
+    });
+  } catch (error) {
+    await removeCookieFile();
+    failBeforeStreaming(500, 'YT_DLP_UNAVAILABLE', error.message);
+    return;
+  }
+
+  res.on('close', () => {
+    if (!isComplete && child && !child.killed) {
+      child.kill('SIGTERM');
+    }
+  });
+
+  child.stderr.on('data', data => {
+    stderr += data.toString();
+  });
+
+  child.stdout.on('data', chunk => {
+    if (!hasStartedResponse) {
+      hasStartedResponse = true;
+      res.setHeader('Content-Type', 'video/mp4');
+      res.setHeader(
+        'Content-Disposition',
+        `attachment; filename="${createSafeFileName(job.title)}"`,
+      );
+    }
+
+    res.write(chunk);
+  });
+
+  child.on('error', async error => {
+    isComplete = true;
+    downloadJobs.delete(downloadId);
+    await removeCookieFile();
+
+    const message =
+      error.code === 'ENOENT'
+        ? 'yt-dlp is not installed or YT_DLP_PATH is incorrect.'
+        : error.message;
+
+    failBeforeStreaming(500, 'YT_DLP_UNAVAILABLE', message);
+  });
+
+  child.on('close', async code => {
+    if (isComplete) {
+      return;
+    }
+
+    isComplete = true;
+    downloadJobs.delete(downloadId);
+    await removeCookieFile();
+
+    if (code !== 0) {
+      failBeforeStreaming(
+        422,
+        'DOWNLOAD_FAILED',
+        cleanYtDlpMessage(stderr) || 'yt-dlp could not download this video.',
+      );
+      return;
+    }
+
+    if (!hasStartedResponse) {
+      failBeforeStreaming(422, 'EMPTY_DOWNLOAD', 'No video data was downloaded.');
+      return;
+    }
+
+    res.end();
+  });
+};
+
+const createDownloadJob = job => {
+  const downloadId = crypto.randomUUID();
+  downloadJobs.set(downloadId, {
+    ...job,
+    createdAt: Date.now(),
+  });
+  cleanupExpiredDownloadJobs();
+  return downloadId;
+};
+
+const cleanupExpiredDownloadJobs = () => {
+  const expiresBefore = Date.now() - DOWNLOAD_JOB_TTL_MS;
+
+  for (const [downloadId, job] of downloadJobs.entries()) {
+    if (job.createdAt < expiresBefore) {
+      downloadJobs.delete(downloadId);
+    }
+  }
+};
+
 const createCookieFile = async cookies => {
   if (!cookies || typeof cookies !== 'string') {
     return null;
@@ -192,9 +343,12 @@ const createCookieFile = async cookies => {
   return cookieFilePath;
 };
 
-const getDirectDownloadUrl = info => {
+const getDirectDownload = info => {
   if (info.url && isValidHttpUrl(info.url)) {
-    return info.url;
+    return {
+      url: info.url,
+      httpHeaders: sanitizeHttpHeaders(info.http_headers),
+    };
   }
 
   const requestedDownload = info.requested_downloads?.find(item =>
@@ -202,14 +356,48 @@ const getDirectDownloadUrl = info => {
   );
 
   if (requestedDownload) {
-    return requestedDownload.url;
+    return {
+      url: requestedDownload.url,
+      httpHeaders: sanitizeHttpHeaders(
+        requestedDownload.http_headers || info.http_headers,
+      ),
+    };
   }
 
   const mp4Format = info.formats
     ?.filter(format => format.ext === 'mp4' && isValidHttpUrl(format.url))
     .sort((a, b) => (b.height || 0) - (a.height || 0))[0];
 
-  return mp4Format?.url || null;
+  return {
+    url: mp4Format?.url || null,
+    httpHeaders: sanitizeHttpHeaders(mp4Format?.http_headers || info.http_headers),
+  };
+};
+
+const sanitizeHttpHeaders = headers => {
+  if (!headers || typeof headers !== 'object') {
+    return undefined;
+  }
+
+  const blockedHeaders = new Set([
+    'accept-encoding',
+    'content-length',
+    'host',
+    'range',
+  ]);
+
+  return Object.entries(headers).reduce((safeHeaders, [key, value]) => {
+    if (!key || value === undefined || value === null) {
+      return safeHeaders;
+    }
+
+    if (blockedHeaders.has(key.toLowerCase())) {
+      return safeHeaders;
+    }
+
+    safeHeaders[key] = String(value);
+    return safeHeaders;
+  }, {});
 };
 
 const getQualityLabel = info => {
@@ -219,6 +407,16 @@ const getQualityLabel = info => {
 
   const height = info.requested_downloads?.find(item => item.height)?.height;
   return height ? `${height}p` : 'best';
+};
+
+const createSafeFileName = title => {
+  const safeTitle = String(title || 'video')
+    .replace(/\.[^/.]+$/, '')
+    .replace(/[^a-z0-9-_]+/gi, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, 70);
+
+  return `${safeTitle || 'video'}.mp4`;
 };
 
 const cleanYtDlpMessage = message =>
@@ -240,4 +438,5 @@ const isValidHttpUrl = value => {
 
 module.exports = {
   extractVideo,
+  streamVideoDownload,
 };
