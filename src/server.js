@@ -12,6 +12,19 @@ const port = process.env.PORT || 8080;
 app.use(helmet());
 app.use(cors());
 app.use(express.json({limit: '1mb'}));
+app.use((req, res, next) => {
+  const startedAt = Date.now();
+
+  res.on('finish', () => {
+    console.log(
+      `[request] ${req.method} ${req.originalUrl} ${res.statusCode} ${
+        Date.now() - startedAt
+      }ms`,
+    );
+  });
+
+  next();
+});
 
 app.get('/health', (_req, res) => {
   res.json({
@@ -31,6 +44,8 @@ app.use((req, res) => {
 
 app.use((err, _req, res, _next) => {
   const statusCode = err.statusCode || 500;
+
+  console.error('[error]', err.code || 'SERVER_ERROR', err.message);
 
   res.status(statusCode).json({
     error: err.code || 'SERVER_ERROR',

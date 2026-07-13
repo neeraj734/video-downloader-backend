@@ -36,6 +36,8 @@ const extractVideo = async (url, options = {}) => {
     url: normalizedUrl,
   });
 
+  console.log(`[extract] job-created id=${downloadId}`);
+
   return {
     title: info.title || 'Untitled video',
     platform: info.extractor_key || info.extractor || 'Unknown',
@@ -154,6 +156,7 @@ const streamVideoDownload = async (downloadId, res) => {
   const job = downloadJobs.get(downloadId);
 
   if (!job) {
+    console.log(`[download] missing-job id=${downloadId}`);
     res.status(404).json({
       error: 'DOWNLOAD_NOT_FOUND',
       message: 'This download link expired. Please prepare the download again.',
@@ -162,6 +165,7 @@ const streamVideoDownload = async (downloadId, res) => {
   }
 
   try {
+    console.log(`[download] ytdlp-start id=${downloadId}`);
     const abortController = new AbortController();
 
     res.on('close', () => {
@@ -174,6 +178,7 @@ const streamVideoDownload = async (downloadId, res) => {
     );
     const stats = await fs.stat(tempFilePath);
     downloadJobs.delete(downloadId);
+    console.log(`[download] ytdlp-complete id=${downloadId} bytes=${stats.size}`);
 
     res.setHeader('Content-Type', 'video/mp4');
     res.setHeader('Content-Length', String(stats.size));
@@ -195,6 +200,7 @@ const streamVideoDownload = async (downloadId, res) => {
 
     stream.on('error', async error => {
       await cleanupTempFile();
+      console.error(`[download] file-stream-error id=${downloadId}`, error.message);
 
       if (!res.headersSent) {
         res.status(500).json({
@@ -208,9 +214,16 @@ const streamVideoDownload = async (downloadId, res) => {
     });
 
     stream.on('close', cleanupTempFile);
+    res.on('finish', () => {
+      console.log(`[download] response-finished id=${downloadId}`);
+    });
     stream.pipe(res);
   } catch (error) {
     const statusCode = error.statusCode || 422;
+    console.error(
+      `[download] failed id=${downloadId} code=${error.code || 'DOWNLOAD_FAILED'}`,
+      error.message,
+    );
 
     if (!res.headersSent) {
       res.status(statusCode).json({
@@ -314,6 +327,7 @@ const downloadJobToTempFile = async (job, abortSignal) => {
           const error = new Error(
             cleanYtDlpMessage(stderr) || 'yt-dlp could not download this video.',
           );
+          console.error('[download] ytdlp-stderr', cleanYtDlpMessage(stderr));
           error.statusCode = 422;
           error.code = 'DOWNLOAD_FAILED';
           reject(error);

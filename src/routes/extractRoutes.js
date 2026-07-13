@@ -29,6 +29,8 @@ router.post('/session/instagram', (req, res) => {
     sessionId: sessionId.trim(),
   });
 
+  console.log('[instagram-session] saved');
+
   return res.json({
     ok: true,
     updatedAt: session.updatedAt,
@@ -49,13 +51,16 @@ router.post('/extract', async (req, res, next) => {
     const cookies = isInstagramUrl(url) ? getInstagramCookieString() : undefined;
 
     if (isInstagramUrl(url) && !cookies) {
+      console.log('[extract] instagram login required');
       return res.status(401).json({
         error: 'INSTAGRAM_LOGIN_REQUIRED',
         message: 'Please login to Instagram before downloading this link.',
       });
     }
 
+    console.log(`[extract] start platform=${isInstagramUrl(url) ? 'instagram' : 'other'}`);
     const result = await extractVideo(url, {cookies});
+    console.log('[extract] success');
     return res.json(result);
   } catch (error) {
     return next(error);
@@ -64,6 +69,7 @@ router.post('/extract', async (req, res, next) => {
 
 router.get('/download/:downloadId', async (req, res, next) => {
   try {
+    console.log(`[download] request id=${req.params.downloadId}`);
     await streamVideoDownload(req.params.downloadId, res);
   } catch (error) {
     return next(error);
