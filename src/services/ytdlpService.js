@@ -6,8 +6,20 @@ const os = require('os');
 const path = require('path');
 
 const YT_DLP_PATH = process.env.YT_DLP_PATH || 'yt-dlp';
+const FFMPEG_PATH = process.env.FFMPEG_PATH || 'ffmpeg';
+const FFPROBE_PATH = process.env.FFPROBE_PATH || 'ffprobe';
 const EXTRACT_TIMEOUT_MS = Number(process.env.EXTRACT_TIMEOUT_MS || 30000);
 const DOWNLOAD_JOB_TTL_MS = Number(process.env.DOWNLOAD_JOB_TTL_MS || 15 * 60 * 1000);
+const PHONE_COMPATIBLE_FORMAT =
+  [
+    'bv*[vcodec^=avc1][ext=mp4]+ba[ext=m4a]',
+    'bv*[vcodec^=avc1][ext=mp4]+ba[acodec^=mp4a]',
+    'b[vcodec^=avc1][acodec!=none][ext=mp4]',
+    'b[acodec!=none][ext=mp4]',
+    'bv*[vcodec^=avc1]+ba[ext=m4a]',
+    'bestvideo+bestaudio',
+    'best[acodec!=none]',
+  ].join('/');
 const downloadJobs = new Map();
 
 const extractVideo = async (url, options = {}) => {
@@ -32,6 +44,7 @@ const extractVideo = async (url, options = {}) => {
 
   const downloadId = createDownloadJob({
     cookies: options.cookies,
+    requireAudio: Boolean(options.requireAudio),
     title: info.title || 'video',
     url: normalizedUrl,
   });
@@ -59,7 +72,9 @@ const runYtDlp = async (url, options = {}) => {
       '--no-warnings',
       '--no-playlist',
       '--format',
-      'b[ext=mp4]/best[ext=mp4]/best',
+      PHONE_COMPATIBLE_FORMAT,
+      '--format-sort',
+      'vcodec:h264,acodec:aac,ext:mp4:m4a',
       url,
     ];
 
@@ -254,7 +269,13 @@ const downloadJobToTempFile = async (job, abortSignal) => {
         '--fragment-retries',
         '10',
         '--format',
-        'b[ext=mp4]/best[ext=mp4]/best',
+        PHONE_COMPATIBLE_FORMAT,
+        '--format-sort',
+        'vcodec:h264,acodec:aac,ext:mp4:m4a',
+        '--merge-output-format',
+        'mp4',
+        '--remux-video',
+        'mp4',
         '--output',
         tempFilePath,
         job.url,
@@ -343,6 +364,23 @@ const downloadJobToTempFile = async (job, abortSignal) => {
       error.statusCode = 422;
       error.code = 'EMPTY_DOWNLOAD';
       throw error;
+    }
+
+    const mediaStreams = await probeMediaStreams(tempFilePath);
+
+    if (job.requireAudio && !mediaStreams.hasAudio) {
+      const error = new Error(
+        'This reel could not be downloaded with audio. Please try another link or refresh your Instagram login.',
+      );
+      error.statusCode = 422;
+      error.code = 'MISSING_AUDIO_TRACK';
+      throw error;
+    }
+
+    if (mediaStreams.hasAudio) {
+      if (mediaStreams.needsAudioTranscode) {
+        await transcodeAudioToAac(tempFilePath);
+      }
     }
 
     return tempFilePath;
@@ -469,6 +507,125 @@ const getDirectDownload = info => {
     url: mp4Format?.url || null,
     httpHeaders: sanitizeHttpHeaders(mp4Format?.http_headers || info.http_headers),
   };
+};
+
+const probeMediaStreams = async filePath =>
+  new Promise(resolve => {
+    const child = spawn(
+      FFPROBE_PATH,
+      [
+        '-v',
+        'error',
+        '-show_entries',
+        'stream=codec_name,codec_type',
+        '-of',
+        'json',
+        filePath,
+      ],
+      {
+        windowsHide: true,
+      },
+    );
+
+    let stdout = '';
+
+    child.stdout.on('data', data => {
+      stdout += data.toString();
+    });
+
+    child.on('error', error => {
+      console.error('[download] ffprobe-unavailable', error.message);
+      resolve({hasAudio: true, needsAudioTranscode: false});
+    });
+
+    child.on('close', code => {
+      if (code !== 0) {
+        resolve({hasAudio: true, needsAudioTranscode: false});
+        return;
+      }
+
+      try {
+        const parsed = JSON.parse(stdout);
+        const audioStreams =
+          parsed.streams?.filter(stream => stream.codec_type === 'audio') || [];
+        resolve({
+          hasAudio: audioStreams.length > 0,
+          needsAudioTranscode: audioStreams.some(
+            stream => !isAndroidFriendlyAudioCodec(stream.codec_name),
+          ),
+        });
+      } catch (_error) {
+        resolve({hasAudio: true, needsAudioTranscode: false});
+      }
+    });
+  });
+
+const isAndroidFriendlyAudioCodec = codecName =>
+  ['aac', 'mp3'].includes(String(codecName || '').toLowerCase());
+
+const transcodeAudioToAac = async filePath => {
+  const outputPath = `${filePath}.audio-fixed.mp4`;
+
+  try {
+    await new Promise((resolve, reject) => {
+      const child = spawn(
+        FFMPEG_PATH,
+        [
+          '-y',
+          '-i',
+          filePath,
+          '-c:v',
+          'copy',
+          '-c:a',
+          'aac',
+          '-b:a',
+          '128k',
+          '-movflags',
+          '+faststart',
+          outputPath,
+        ],
+        {
+          windowsHide: true,
+        },
+      );
+
+      let stderr = '';
+
+      child.stderr.on('data', data => {
+        stderr += data.toString();
+      });
+
+      child.on('error', error => {
+        const wrappedError = new Error(
+          error.code === 'ENOENT'
+            ? 'ffmpeg is not installed or FFMPEG_PATH is incorrect.'
+            : error.message,
+        );
+        wrappedError.statusCode = 500;
+        wrappedError.code = 'FFMPEG_UNAVAILABLE';
+        reject(wrappedError);
+      });
+
+      child.on('close', code => {
+        if (code === 0) {
+          resolve();
+          return;
+        }
+
+        const error = new Error(
+          cleanYtDlpMessage(stderr) || 'ffmpeg could not normalize the audio.',
+        );
+        error.statusCode = 422;
+        error.code = 'AUDIO_NORMALIZE_FAILED';
+        reject(error);
+      });
+    });
+
+    await fs.rename(outputPath, filePath);
+  } catch (error) {
+    await fs.rm(outputPath, {force: true});
+    throw error;
+  }
 };
 
 const sanitizeHttpHeaders = headers => {

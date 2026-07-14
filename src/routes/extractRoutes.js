@@ -60,7 +60,10 @@ router.post('/extract', async (req, res, next) => {
     }
 
     console.log(`[extract] start platform=${isInstagramUrl(url) ? 'instagram' : 'other'}`);
-    const result = await extractVideo(url, {cookies});
+    const result = await extractVideo(url, {
+      cookies,
+      requireAudio: isInstagramUrl(url),
+    });
     console.log('[extract] success');
     return res.json(result);
   } catch (error) {
