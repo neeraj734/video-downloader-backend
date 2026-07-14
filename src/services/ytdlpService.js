@@ -10,15 +10,13 @@ const FFMPEG_PATH = process.env.FFMPEG_PATH || 'ffmpeg';
 const FFPROBE_PATH = process.env.FFPROBE_PATH || 'ffprobe';
 const EXTRACT_TIMEOUT_MS = Number(process.env.EXTRACT_TIMEOUT_MS || 30000);
 const DOWNLOAD_JOB_TTL_MS = Number(process.env.DOWNLOAD_JOB_TTL_MS || 15 * 60 * 1000);
-const PHONE_COMPATIBLE_FORMAT =
+const DOWNLOAD_FORMAT =
   [
-    'bv*[vcodec^=avc1][ext=mp4]+ba[ext=m4a]',
-    'bv*[vcodec^=avc1][ext=mp4]+ba[acodec^=mp4a]',
-    'b[vcodec^=avc1][acodec!=none][ext=mp4]',
+    'bv*+ba',
     'b[acodec!=none][ext=mp4]',
-    'bv*[vcodec^=avc1]+ba[ext=m4a]',
-    'bestvideo+bestaudio',
+    'b[acodec!=none]',
     'best[acodec!=none]',
+    'best',
   ].join('/');
 const downloadJobs = new Map();
 
@@ -33,14 +31,6 @@ const extractVideo = async (url, options = {}) => {
   }
 
   const info = await runYtDlp(normalizedUrl, options);
-  const directDownload = getDirectDownload(info);
-
-  if (!directDownload.url) {
-    const error = new Error('Could not extract a direct downloadable video URL.');
-    error.statusCode = 422;
-    error.code = 'NO_DOWNLOAD_URL';
-    throw error;
-  }
 
   const downloadId = createDownloadJob({
     cookies: options.cookies,
@@ -71,10 +61,6 @@ const runYtDlp = async (url, options = {}) => {
       '--dump-single-json',
       '--no-warnings',
       '--no-playlist',
-      '--format',
-      PHONE_COMPATIBLE_FORMAT,
-      '--format-sort',
-      'vcodec:h264,acodec:aac,ext:mp4:m4a',
       url,
     ];
 
@@ -269,9 +255,7 @@ const downloadJobToTempFile = async (job, abortSignal) => {
         '--fragment-retries',
         '10',
         '--format',
-        PHONE_COMPATIBLE_FORMAT,
-        '--format-sort',
-        'vcodec:h264,acodec:aac,ext:mp4:m4a',
+        DOWNLOAD_FORMAT,
         '--merge-output-format',
         'mp4',
         '--remux-video',
@@ -478,37 +462,6 @@ const createCookieFile = async cookies => {
   return cookieFilePath;
 };
 
-const getDirectDownload = info => {
-  if (info.url && isValidHttpUrl(info.url)) {
-    return {
-      url: info.url,
-      httpHeaders: sanitizeHttpHeaders(info.http_headers),
-    };
-  }
-
-  const requestedDownload = info.requested_downloads?.find(item =>
-    isValidHttpUrl(item.url),
-  );
-
-  if (requestedDownload) {
-    return {
-      url: requestedDownload.url,
-      httpHeaders: sanitizeHttpHeaders(
-        requestedDownload.http_headers || info.http_headers,
-      ),
-    };
-  }
-
-  const mp4Format = info.formats
-    ?.filter(format => format.ext === 'mp4' && isValidHttpUrl(format.url))
-    .sort((a, b) => (b.height || 0) - (a.height || 0))[0];
-
-  return {
-    url: mp4Format?.url || null,
-    httpHeaders: sanitizeHttpHeaders(mp4Format?.http_headers || info.http_headers),
-  };
-};
-
 const probeMediaStreams = async filePath =>
   new Promise(resolve => {
     const child = spawn(
@@ -626,32 +579,6 @@ const transcodeAudioToAac = async filePath => {
     await fs.rm(outputPath, {force: true});
     throw error;
   }
-};
-
-const sanitizeHttpHeaders = headers => {
-  if (!headers || typeof headers !== 'object') {
-    return undefined;
-  }
-
-  const blockedHeaders = new Set([
-    'accept-encoding',
-    'content-length',
-    'host',
-    'range',
-  ]);
-
-  return Object.entries(headers).reduce((safeHeaders, [key, value]) => {
-    if (!key || value === undefined || value === null) {
-      return safeHeaders;
-    }
-
-    if (blockedHeaders.has(key.toLowerCase())) {
-      return safeHeaders;
-    }
-
-    safeHeaders[key] = String(value);
-    return safeHeaders;
-  }, {});
 };
 
 const getQualityLabel = info => {
