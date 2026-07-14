@@ -8,7 +8,7 @@ const {extractVideo, streamVideoDownload} = require('../services/ytdlpService');
 const router = express.Router();
 
 router.post('/session/instagram', (req, res) => {
-  const {sessionId, csrfToken} = req.body || {};
+  const {sessionId, csrfToken, cookieHeader} = req.body || {};
 
   if (!sessionId || typeof sessionId !== 'string') {
     return res.status(400).json({
@@ -25,6 +25,7 @@ router.post('/session/instagram', (req, res) => {
   }
 
   const session = saveInstagramSession({
+    cookieHeader,
     csrfToken: csrfToken.trim(),
     sessionId: sessionId.trim(),
   });

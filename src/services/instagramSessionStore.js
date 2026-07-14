@@ -1,7 +1,8 @@
 let instagramSession = null;
 
-const saveInstagramSession = ({sessionId, csrfToken}) => {
+const saveInstagramSession = ({sessionId, csrfToken, cookieHeader}) => {
   instagramSession = {
+    cookieHeader: sanitizeCookieHeader(cookieHeader),
     csrfToken,
     sessionId,
     updatedAt: Date.now(),
@@ -15,7 +16,22 @@ const getInstagramCookieString = () => {
     return undefined;
   }
 
-  return `sessionid=${instagramSession.sessionId}; csrftoken=${instagramSession.csrfToken}`;
+  return (
+    instagramSession.cookieHeader ||
+    `sessionid=${instagramSession.sessionId}; csrftoken=${instagramSession.csrfToken}`
+  );
+};
+
+const sanitizeCookieHeader = cookieHeader => {
+  if (!cookieHeader || typeof cookieHeader !== 'string') {
+    return undefined;
+  }
+
+  return cookieHeader
+    .split(';')
+    .map(cookie => cookie.trim())
+    .filter(cookie => cookie.includes('='))
+    .join('; ');
 };
 
 module.exports = {
