@@ -1,5 +1,4 @@
 const {spawn} = require('child_process');
-const crypto = require('crypto');
 const {createReadStream} = require('fs');
 const fs = require('fs/promises');
 const os = require('os');
@@ -9,7 +8,6 @@ const YT_DLP_PATH = process.env.YT_DLP_PATH || 'yt-dlp';
 const FFMPEG_PATH = process.env.FFMPEG_PATH || 'ffmpeg';
 const FFPROBE_PATH = process.env.FFPROBE_PATH || 'ffprobe';
 const EXTRACT_TIMEOUT_MS = Number(process.env.EXTRACT_TIMEOUT_MS || 30000);
-const DOWNLOAD_JOB_TTL_MS = Number(process.env.DOWNLOAD_JOB_TTL_MS || 15 * 60 * 1000);
 const DOWNLOAD_FORMAT =
   [
     'bv*+ba',
@@ -18,7 +16,6 @@ const DOWNLOAD_FORMAT =
     'best[acodec!=none]',
     'best',
   ].join('/');
-const downloadJobs = new Map();
 
 const extractVideo = async (url, options = {}) => {
   const normalizedUrl = url.trim();
@@ -32,23 +29,12 @@ const extractVideo = async (url, options = {}) => {
 
   const info = await runYtDlp(normalizedUrl, options);
 
-  const downloadId = createDownloadJob({
-    cookies: options.cookies,
-    requireAudio: Boolean(options.requireAudio),
-    title: info.title || 'video',
-    url: normalizedUrl,
-  });
-
-  console.log(`[extract] job-created id=${downloadId}`);
-
   return {
     title: info.title || 'Untitled video',
     platform: info.extractor_key || info.extractor || 'Unknown',
     thumbnail: info.thumbnail || null,
     duration: info.duration || null,
     quality: getQualityLabel(info),
-    downloadPath: `/api/download/${downloadId}`,
-    httpHeaders: undefined,
   };
 };
 
@@ -151,52 +137,63 @@ const runYtDlp = async (url, options = {}) => {
   }
 };
 
-const streamVideoDownload = async (downloadId, res) => {
-  cleanupExpiredDownloadJobs();
+const streamVideoDownload = async (job, res) => {
+  const normalizedUrl = typeof job?.url === 'string' ? job.url.trim() : '';
 
-  const job = downloadJobs.get(downloadId);
-
-  if (!job) {
-    console.log(`[download] missing-job id=${downloadId}`);
-    res.status(404).json({
-      error: 'DOWNLOAD_NOT_FOUND',
-      message: 'This download link expired. Please prepare the download again.',
+  if (!isValidHttpUrl(normalizedUrl)) {
+    res.status(400).json({
+      error: 'INVALID_URL',
+      message: 'A valid video URL is required.',
     });
     return;
   }
 
-  try {
-    console.log(`[download] ytdlp-start id=${downloadId}`);
-    if (!job.tempFilePath) {
-      const abortController = new AbortController();
+  const downloadJob = {
+    ...job,
+    title: job.title || 'video',
+    url: normalizedUrl,
+  };
+  let tempFilePath;
+  let didCleanUp = false;
 
-      res.on('close', () => {
-        abortController.abort();
-      });
-
-      job.tempFilePath = await downloadJobToTempFile(
-        job,
-        abortController.signal,
-      );
-      job.completedAt = Date.now();
-      job.fileSize = (await fs.stat(job.tempFilePath)).size;
-      console.log(
-        `[download] ytdlp-complete id=${downloadId} bytes=${job.fileSize}`,
-      );
-    } else {
-      console.log(`[download] cached-file id=${downloadId} bytes=${job.fileSize}`);
+  const cleanupTempFile = () => {
+    if (!tempFilePath || didCleanUp) {
+      return;
     }
 
+    didCleanUp = true;
+    fs.rm(tempFilePath, {force: true}).catch(error => {
+      console.error('[download] temp-cleanup-failed', error.message);
+    });
+  };
+
+  try {
+    console.log('[download] ytdlp-start');
+    const abortController = new AbortController();
+
+    res.on('close', () => {
+      if (!tempFilePath) {
+        abortController.abort();
+      }
+    });
+
+    tempFilePath = await downloadJobToTempFile(
+      downloadJob,
+      abortController.signal,
+    );
+    const fileSize = (await fs.stat(tempFilePath)).size;
+    console.log(`[download] ytdlp-complete bytes=${fileSize}`);
+
     res.setHeader('Content-Type', 'video/mp4');
-    res.setHeader('Content-Length', String(job.fileSize));
+    res.setHeader('Content-Length', String(fileSize));
     res.setHeader(
       'Content-Disposition',
-      `attachment; filename="${createSafeFileName(job.title)}"`,
+      `attachment; filename="${createSafeFileName(downloadJob.title)}"`,
     );
 
-    const stream = createReadStream(job.tempFilePath);
+    const stream = createReadStream(tempFilePath);
     stream.on('error', async error => {
-      console.error(`[download] file-stream-error id=${downloadId}`, error.message);
+      console.error('[download] file-stream-error', error.message);
 
       if (!res.headersSent) {
         res.status(500).json({
@@ -210,21 +207,23 @@ const streamVideoDownload = async (downloadId, res) => {
     });
 
     res.on('finish', () => {
-      console.log(`[download] response-finished id=${downloadId}`);
+      console.log('[download] response-finished');
+      cleanupTempFile();
+    });
+    res.on('close', () => {
+      stream.destroy();
+      cleanupTempFile();
     });
     stream.pipe(res);
   } catch (error) {
     const statusCode = error.statusCode || 422;
     console.error(
-      `[download] failed id=${downloadId} code=${error.code || 'DOWNLOAD_FAILED'}`,
+      `[download] failed code=${error.code || 'DOWNLOAD_FAILED'}`,
       error.message,
     );
 
-    if (!job.tempFilePath) {
-      downloadJobs.delete(downloadId);
-    }
-
     if (!res.headersSent) {
+      cleanupTempFile();
       res.status(statusCode).json({
         error: error.code || 'DOWNLOAD_FAILED',
         message: error.message || 'yt-dlp could not download this video.',
@@ -232,6 +231,7 @@ const streamVideoDownload = async (downloadId, res) => {
       return;
     }
 
+    cleanupTempFile();
     res.destroy(error);
   }
 };
@@ -374,35 +374,6 @@ const downloadJobToTempFile = async (job, abortSignal) => {
   } finally {
     if (cookieFilePath) {
       await fs.rm(cookieFilePath, {force: true});
-    }
-  }
-};
-
-const createDownloadJob = job => {
-  const downloadId = crypto.randomUUID();
-  downloadJobs.set(downloadId, {
-    ...job,
-    createdAt: Date.now(),
-  });
-  cleanupExpiredDownloadJobs();
-  return downloadId;
-};
-
-const cleanupExpiredDownloadJobs = () => {
-  const expiresBefore = Date.now() - DOWNLOAD_JOB_TTL_MS;
-
-  for (const [downloadId, job] of downloadJobs.entries()) {
-    if (job.createdAt < expiresBefore) {
-      if (job.tempFilePath) {
-        fs.rm(job.tempFilePath, {force: true}).catch(error => {
-          console.error(
-            `[download] temp-cleanup-failed id=${downloadId}`,
-            error.message,
-          );
-        });
-      }
-
-      downloadJobs.delete(downloadId);
     }
   }
 };

@@ -71,10 +71,41 @@ router.post('/extract', async (req, res, next) => {
   }
 });
 
-router.get('/download/:downloadId', async (req, res, next) => {
+router.post('/download', async (req, res, next) => {
   try {
-    console.log(`[download] request id=${req.params.downloadId}`);
-    await streamVideoDownload(req.params.downloadId, res);
+    const {url, cookies} = req.body || {};
+
+    if (!url || typeof url !== 'string') {
+      return res.status(400).json({
+        error: 'INVALID_URL',
+        message: 'A video URL is required.',
+      });
+    }
+
+    const cookieHeader =
+      typeof cookies === 'string' && cookies.trim()
+        ? cookies.trim()
+        : isInstagramUrl(url)
+          ? getInstagramCookieString()
+          : undefined;
+
+    if (isInstagramUrl(url) && !cookieHeader) {
+      console.log('[download] instagram login required');
+      return res.status(401).json({
+        error: 'INSTAGRAM_LOGIN_REQUIRED',
+        message: 'Please login to Instagram before downloading this link.',
+      });
+    }
+
+    console.log(`[download] request platform=${isInstagramUrl(url) ? 'instagram' : 'other'}`);
+    await streamVideoDownload(
+      {
+        cookies: cookieHeader,
+        requireAudio: isInstagramUrl(url),
+        url,
+      },
+      res,
+    );
   } catch (error) {
     return next(error);
   }
