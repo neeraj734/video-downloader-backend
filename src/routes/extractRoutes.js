@@ -71,9 +71,9 @@ router.post('/extract', async (req, res, next) => {
   }
 });
 
-router.post('/download', async (req, res, next) => {
+router.get('/download', async (req, res, next) => {
   try {
-    const {url, cookies} = req.body || {};
+    const {url, cookies} = req.query || {};
 
     if (!url || typeof url !== 'string') {
       return res.status(400).json({
