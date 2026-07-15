@@ -6,7 +6,8 @@ const path = require('path');
 
 const YT_DLP_PATH = process.env.YT_DLP_PATH || 'yt-dlp';
 const EXTRACT_TIMEOUT_MS = Number(process.env.EXTRACT_TIMEOUT_MS || 30000);
-const DOWNLOAD_FORMAT = 'bestvideo[ext=mp4]+bestaudio[ext=mp4]/best[ext=mp4]/best';
+// const DOWNLOAD_FORMAT = 'bestvideo[ext=mp4]+bestaudio[ext=mp4]/best[ext=mp4]/best';
+const DOWNLOAD_FORMAT = 'bestvideo+bestaudio/best';
 
 const extractVideo = async (url, options = {}) => {
   const normalizedUrl = url.trim();
