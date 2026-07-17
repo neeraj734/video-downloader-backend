@@ -342,6 +342,59 @@ const downloadJobToTempFile = async (job, abortSignal) => {
       throw error;
     }
 
+    const hasAudioStream = await new Promise((resolve, reject) => {
+      const child = spawn(
+        'ffprobe',
+        [
+          '-v',
+          'error',
+          '-select_streams',
+          'a:0',
+          '-show_entries',
+          'stream=index',
+          '-of',
+          'csv=p=0',
+          tempFilePath,
+        ],
+        {windowsHide: true},
+      );
+      let stdout = '';
+      let stderr = '';
+
+      child.stdout.on('data', data => {
+        stdout += data.toString();
+      });
+      child.stderr.on('data', data => {
+        stderr += data.toString();
+      });
+      child.on('error', error => {
+        console.error('[download] audio-stream probe-error', error.message);
+        reject(error);
+      });
+      child.on('close', code => {
+        if (code !== 0) {
+          const error = new Error(
+            cleanYtDlpMessage(stderr) || 'ffprobe could not inspect the video.',
+          );
+          console.error('[download] audio-stream probe-error', error.message);
+          reject(error);
+          return;
+        }
+
+        resolve(Boolean(stdout.trim()));
+      });
+    });
+
+    console.log(
+      `[download] audio-stream ${hasAudioStream ? 'found' : 'not-found'}`,
+    );
+
+    if (job.requireAudio && !hasAudioStream) {
+      const error = new Error('NO_AUDIO_STREAM');
+      error.statusCode = 422;
+      error.code = 'NO_AUDIO_STREAM';
+      throw error;
+    }
     return tempFilePath;
   } catch (error) {
     await fs.rm(tempFilePath, {force: true});
