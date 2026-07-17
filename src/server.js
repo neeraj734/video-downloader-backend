@@ -35,6 +35,38 @@ app.get('/health', (_req, res) => {
 });
 
 app.use('/api', extractRoutes);
+app.get('/debug/formats', (req, res) => {
+  const {execFileSync} = require('child_process');
+  const url = req.query.url;
+
+  if (!url) {
+    return res.status(400).json({error: 'Missing url parameter'});
+  }
+
+  let hostname;
+
+  try {
+    hostname = new URL(url).hostname;
+  } catch (_error) {
+    return res.status(400).json({error: 'Invalid URL'});
+  }
+
+  const allowed = ['instagram.com', 'www.instagram.com'];
+
+  if (!allowed.includes(hostname)) {
+    return res.status(403).json({error: 'Domain not allowed'});
+  }
+
+  try {
+    const output = execFileSync('yt-dlp', ['-F', url], {
+      timeout: 30000,
+    }).toString();
+    return res.type('text/plain').send(output);
+  } catch (err) {
+    return res.status(500).type('text/plain').send('Error: ' + err.message);
+  }
+});
+
 
 app.use((req, res) => {
   res.status(404).json({
