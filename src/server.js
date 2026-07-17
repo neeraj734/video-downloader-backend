@@ -1,4 +1,5 @@
 const cors = require('cors');
+const {execSync} = require('child_process');
 const dotenv = require('dotenv');
 const express = require('express');
 const helmet = require('helmet');
@@ -55,4 +56,5 @@ app.use((err, _req, res, _next) => {
 
 app.listen(port, () => {
   console.log(`Video downloader backend running on port ${port}`);
+  console.log('yt-dlp version:', execSync('yt-dlp --version').toString().trim());
 });
