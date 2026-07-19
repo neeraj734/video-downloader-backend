@@ -6,6 +6,7 @@ const {
 const {extractVideo, streamVideoDownload} = require('../services/ytdlpService');
 
 const router = express.Router();
+const INSTAGRAM_RETRY_DELAYS_MS = [3000, 5000];
 
 router.post('/session/instagram', (req, res) => {
   const {sessionId, csrfToken, cookieHeader} = req.body || {};
@@ -49,9 +50,10 @@ router.post('/extract', async (req, res, next) => {
       });
     }
 
-    const cookies = isInstagramUrl(url) ? getInstagramCookieString() : undefined;
+    const isInstagram = isInstagramUrl(url);
+    const cookies = isInstagram ? getInstagramCookieString() : undefined;
 
-    if (isInstagramUrl(url) && !cookies) {
+    if (isInstagram && !cookies) {
       console.log('[extract] instagram login required');
       return res.status(401).json({
         error: 'INSTAGRAM_LOGIN_REQUIRED',
@@ -59,11 +61,15 @@ router.post('/extract', async (req, res, next) => {
       });
     }
 
-    console.log(`[extract] start platform=${isInstagramUrl(url) ? 'instagram' : 'other'}`);
-    const result = await extractVideo(url, {
-      cookies,
-      requireAudio: isInstagramUrl(url),
-    });
+    console.log(`[extract] start platform=${isInstagram ? 'instagram' : 'other'}`);
+    const extract = () =>
+      extractVideo(url, {
+        cookies,
+        requireAudio: isInstagram,
+      });
+    const result = isInstagram
+      ? await retryInstagramRequest('extract', extract)
+      : await extract();
     console.log('[extract] success');
     return res.json(result);
   } catch (error) {
@@ -82,14 +88,15 @@ router.get('/download', async (req, res, next) => {
       });
     }
 
+    const isInstagram = isInstagramUrl(url);
     const cookieHeader =
       typeof cookies === 'string' && cookies.trim()
         ? cookies.trim()
-        : isInstagramUrl(url)
+        : isInstagram
           ? getInstagramCookieString()
           : undefined;
 
-    if (isInstagramUrl(url) && !cookieHeader) {
+    if (isInstagram && !cookieHeader) {
       console.log('[download] instagram login required');
       return res.status(401).json({
         error: 'INSTAGRAM_LOGIN_REQUIRED',
@@ -97,20 +104,57 @@ router.get('/download', async (req, res, next) => {
       });
     }
 
-    console.log(`[download] request platform=${isInstagramUrl(url) ? 'instagram' : 'other'}`);
-    await streamVideoDownload(
-      {
-        cookies: cookieHeader,
-        requireAudio: isInstagramUrl(url),
-        url,
-      },
-      res,
-    );
+    console.log(`[download] request platform=${isInstagram ? 'instagram' : 'other'}`);
+    const download = () =>
+      streamVideoDownload(
+        {
+          cookies: cookieHeader,
+          requireAudio: isInstagram,
+          throwOnError: isInstagram,
+          url,
+        },
+        res,
+      );
+
+    if (isInstagram) {
+      await retryInstagramRequest('download', download);
+    } else {
+      await download();
+    }
   } catch (error) {
     return next(error);
   }
 });
 
 const isInstagramUrl = url => url.toLowerCase().includes('instagram.com');
+
+const retryInstagramRequest = async (routeName, request) => {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await request();
+    } catch (error) {
+      const retryDelay = INSTAGRAM_RETRY_DELAYS_MS[attempt];
+
+      if (retryDelay === undefined || !isRetryableInstagramError(error)) {
+        throw error;
+      }
+
+      console.log(
+        `[${routeName}] instagram retry attempt=${attempt + 1} delayMs=${retryDelay} code=${
+          error.code || 'UNKNOWN'
+        } status=${error.statusCode || 'UNKNOWN'}`,
+      );
+      await delay(retryDelay);
+    }
+  }
+};
+
+const isRetryableInstagramError = error =>
+  error?.code === 'NO_AUDIO_STREAM' ||
+  error?.statusCode === 404 ||
+  error?.statusCode === 422;
+
+const delay = milliseconds =>
+  new Promise(resolve => setTimeout(resolve, milliseconds));
 
 module.exports = router;

@@ -214,6 +214,11 @@ const streamVideoDownload = async (job, res) => {
       error.message,
     );
 
+    if (job.throwOnError) {
+      cleanupTempFile();
+      throw error;
+    }
+
     if (!res.headersSent) {
       cleanupTempFile();
       res.status(statusCode).json({
